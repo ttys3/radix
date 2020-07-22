@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"reflect"
-	"strings"
 	"testing"
 	. "testing"
 
@@ -20,8 +20,9 @@ import (
 
 func TestPeekAndAssertPrefix(t *T) {
 	type test struct {
-		in, prefix []byte
-		exp        error
+		in     []byte
+		prefix Prefix
+		exp    error
 	}
 
 	tests := []test{
@@ -32,9 +33,11 @@ func TestPeekAndAssertPrefix(t *T) {
 			},
 		}},
 		{[]byte("-foo\r\n"), SimpleErrorPrefix, nil},
-		// TODO BlobErrorPrefix
 		{[]byte("-foo\r\n"), NumberPrefix, resp.ErrConnUsable{Err: SimpleError{
-			E: errors.New("foo"),
+			S: "foo",
+		}}},
+		{[]byte("!3\r\nfoo\r\n"), NumberPrefix, resp.ErrConnUsable{Err: BlobError{
+			B: []byte("foo"),
 		}}},
 	}
 
@@ -55,197 +58,13 @@ func TestPeekAndAssertPrefix(t *T) {
 	}
 }
 
-func TestRESPTypes(t *T) {
-	// TODO only used by BulkReader test
-	//newLR := func(s string) resp.LenReader {
-	//	buf := bytes.NewBufferString(s)
-	//	return resp.NewLenReader(buf, int64(buf.Len()))
-	//}
-
-	newBigInt := func(s string) *big.Int {
-		i, _ := new(big.Int).SetString(s, 10)
-		return i
-	}
-
-	type encodeTest struct {
-		in  resp.Marshaler
-		exp string
-
-		// unmarshal is the string to unmarshal. defaults to exp if not set.
-		unmarshal string
-
-		// if set then when exp is unmarshaled back into in the value will be
-		// asserted to be this value rather than in.
-		expUnmarshal interface{}
-
-		errStr bool
-
-		// if set then the test won't be performed a second time with a
-		// preceding attribute element when unmarshaling
-		noAttrTest bool
-	}
-
-	encodeTests := []encodeTest{
-		{in: &BlobStringBytes{B: nil}, exp: "$0\r\n\r\n"},
-		{in: &BlobStringBytes{B: []byte{}}, exp: "$0\r\n\r\n",
-			expUnmarshal: &BlobStringBytes{B: nil}},
-		{in: &BlobStringBytes{B: []byte("foo")}, exp: "$3\r\nfoo\r\n"},
-		{in: &BlobStringBytes{B: []byte("foo\r\nbar")}, exp: "$8\r\nfoo\r\nbar\r\n"},
-		{in: &BlobStringBytes{StreamedStringHeader: true}, exp: "$?\r\n"},
-		{in: &BlobString{S: ""}, exp: "$0\r\n\r\n"},
-		{in: &BlobString{S: "foo"}, exp: "$3\r\nfoo\r\n"},
-		{in: &BlobString{S: "foo\r\nbar"}, exp: "$8\r\nfoo\r\nbar\r\n"},
-		{in: &BlobString{StreamedStringHeader: true}, exp: "$?\r\n"},
-
-		{in: &SimpleString{S: ""}, exp: "+\r\n"},
-		{in: &SimpleString{S: "foo"}, exp: "+foo\r\n"},
-
-		{in: &SimpleError{E: errors.New("")}, exp: "-\r\n", errStr: true},
-		{in: &SimpleError{E: errors.New("foo")}, exp: "-foo\r\n", errStr: true},
-
-		{in: &Number{N: 5}, exp: ":5\r\n"},
-		{in: &Number{N: 0}, exp: ":0\r\n"},
-		{in: &Number{N: -5}, exp: ":-5\r\n"},
-
-		{in: &Null{}, exp: "_\r\n"},
-		{in: &Null{}, exp: "_\r\n", unmarshal: "$-1\r\n"},
-		{in: &Null{}, exp: "_\r\n", unmarshal: "*-1\r\n"},
-
-		{in: &Double{F: 0}, exp: ",0\r\n"},
-		{in: &Double{F: 1.5}, exp: ",1.5\r\n"},
-		{in: &Double{F: -1.5}, exp: ",-1.5\r\n"},
-		{in: &Double{F: math.Inf(1)}, exp: ",inf\r\n"},
-		{in: &Double{F: math.Inf(-1)}, exp: ",-inf\r\n"},
-
-		{in: &Boolean{B: false}, exp: "#f\r\n"},
-		{in: &Boolean{B: true}, exp: "#t\r\n"},
-
-		{in: &BlobError{E: errors.New("")}, exp: "!0\r\n\r\n"},
-		{in: &BlobError{E: errors.New("foo")}, exp: "!3\r\nfoo\r\n"},
-		{in: &BlobError{E: errors.New("foo\r\nbar")}, exp: "!8\r\nfoo\r\nbar\r\n"},
-
-		{in: &VerbatimStringBytes{B: nil, Format: []byte("txt")}, exp: "=4\r\ntxt:\r\n"},
-		{in: &VerbatimStringBytes{B: []byte{}, Format: []byte("txt")}, exp: "=4\r\ntxt:\r\n",
-			expUnmarshal: &VerbatimStringBytes{B: nil, Format: []byte("txt")}},
-		{in: &VerbatimStringBytes{B: []byte("foo"), Format: []byte("txt")}, exp: "=7\r\ntxt:foo\r\n"},
-		{in: &VerbatimStringBytes{B: []byte("foo\r\nbar"), Format: []byte("txt")}, exp: "=12\r\ntxt:foo\r\nbar\r\n"},
-		{in: &VerbatimString{S: "", Format: "txt"}, exp: "=4\r\ntxt:\r\n"},
-		{in: &VerbatimString{S: "foo", Format: "txt"}, exp: "=7\r\ntxt:foo\r\n"},
-		{in: &VerbatimString{S: "foo\r\nbar", Format: "txt"}, exp: "=12\r\ntxt:foo\r\nbar\r\n"},
-
-		{in: &BigNumber{I: newBigInt("3492890328409238509324850943850943825024385")}, exp: "(3492890328409238509324850943850943825024385\r\n"},
-		{in: &BigNumber{I: newBigInt("0")}, exp: "(0\r\n"},
-		{in: &BigNumber{I: newBigInt("-3492890328409238509324850943850943825024385")}, exp: "(-3492890328409238509324850943850943825024385\r\n"},
-
-		// TODO what to do with BulkReader
-		//{in: &BulkReader{LR: newLR("foo\r\nbar")}, exp: "$8\r\nfoo\r\nbar\r\n"},
-
-		{in: &ArrayHeader{NumElems: 0}, exp: "*0\r\n"},
-		{in: &ArrayHeader{NumElems: 5}, exp: "*5\r\n"},
-		{in: &ArrayHeader{StreamedArrayHeader: true}, exp: "*?\r\n"},
-
-		{in: &MapHeader{NumPairs: 0}, exp: "%0\r\n"},
-		{in: &MapHeader{NumPairs: 5}, exp: "%5\r\n"},
-		{in: &MapHeader{StreamedMapHeader: true}, exp: "%?\r\n"},
-
-		{in: &SetHeader{NumElems: 0}, exp: "~0\r\n"},
-		{in: &SetHeader{NumElems: 5}, exp: "~5\r\n"},
-		{in: &SetHeader{StreamedSetHeader: true}, exp: "~?\r\n"},
-
-		{in: &AttributeHeader{NumPairs: 0}, exp: "|0\r\n", noAttrTest: true},
-		{in: &AttributeHeader{NumPairs: 5}, exp: "|5\r\n", noAttrTest: true},
-
-		{in: &PushHeader{NumElems: 0}, exp: ">0\r\n"},
-		{in: &PushHeader{NumElems: 5}, exp: ">5\r\n"},
-
-		{in: &StreamedStringChunkBytes{B: nil}, exp: ";0\r\n"},
-		{in: &StreamedStringChunkBytes{B: []byte{}}, exp: ";0\r\n",
-			expUnmarshal: &StreamedStringChunkBytes{B: nil}},
-		{in: &StreamedStringChunkBytes{B: []byte("foo")}, exp: ";3\r\nfoo\r\n"},
-		{in: &StreamedStringChunkBytes{B: []byte("foo\r\nbar")}, exp: ";8\r\nfoo\r\nbar\r\n"},
-		{in: &StreamedStringChunk{S: ""}, exp: ";0\r\n"},
-		{in: &StreamedStringChunk{S: "foo"}, exp: ";3\r\nfoo\r\n"},
-		{in: &StreamedStringChunk{S: "foo\r\nbar"}, exp: ";8\r\nfoo\r\nbar\r\n"},
-	}
-
-	for i, et := range encodeTests {
-		typName := reflect.TypeOf(et.in).Elem().String()
-		t.Run(fmt.Sprintf("noAttr/%s/%d", typName, i), func(t *testing.T) {
-			buf := new(bytes.Buffer)
-			err := et.in.MarshalRESP(buf)
-			assert.Nil(t, err)
-			assert.Equal(t, et.exp, buf.String())
-
-			if et.unmarshal != "" {
-				buf.Reset()
-				buf.WriteString(et.unmarshal)
-			}
-
-			br := bufio.NewReader(buf)
-			umr := reflect.New(reflect.TypeOf(et.in).Elem())
-			um := umr.Interface().(resp.Unmarshaler)
-
-			err = um.UnmarshalRESP(br)
-			assert.Nil(t, err)
-			assert.Empty(t, buf.String())
-
-			var exp interface{} = et.in
-			var got interface{} = umr.Interface()
-			if et.errStr {
-				exp = exp.(error).Error()
-				got = got.(error).Error()
-			} else if et.expUnmarshal != nil {
-				exp = et.expUnmarshal
-			}
-			assert.Equal(t, exp, got)
-		})
-	}
-
-	// do the unmarshal half of the tests again, but this time with a preceding
-	// attribute which should be ignored.
-	for i, et := range encodeTests {
-		if et.noAttrTest {
-			continue
-		}
-
-		typName := reflect.TypeOf(et.in).Elem().String()
-		t.Run(fmt.Sprintf("attr/%s/%d", typName, i), func(t *testing.T) {
-			buf := new(bytes.Buffer)
-			buf.WriteString("|1\r\n+foo\r\n+bar\r\n")
-			if et.unmarshal != "" {
-				buf.WriteString(et.unmarshal)
-			} else {
-				buf.WriteString(et.exp)
-			}
-
-			br := bufio.NewReader(buf)
-			umr := reflect.New(reflect.TypeOf(et.in).Elem())
-			um := umr.Interface().(resp.Unmarshaler)
-
-			err := um.UnmarshalRESP(br)
-			assert.Nil(t, err)
-			assert.Empty(t, buf.String())
-
-			var exp interface{} = et.in
-			var got interface{} = umr.Interface()
-			if et.errStr {
-				exp = exp.(error).Error()
-				got = got.(error).Error()
-			} else if et.expUnmarshal != nil {
-				exp = et.expUnmarshal
-			}
-			assert.Equal(t, exp, got)
-		})
-	}
-}
-
 // structs used for tests
-type testStructInner struct {
+type TestStructInner struct {
 	Foo int
 	bar int
 	Baz string `redis:"BAZ"`
 	Buz string `redis:"-"`
-	Boz *int
+	Boz *int64
 }
 
 func intPtr(i int) *int {
@@ -253,12 +72,12 @@ func intPtr(i int) *int {
 }
 
 type testStructA struct {
-	testStructInner
+	TestStructInner
 	Biz []byte
 }
 
 type testStructB struct {
-	*testStructInner
+	*TestStructInner
 	Biz []byte
 }
 
@@ -266,517 +85,1645 @@ type testStructC struct {
 	Biz *string
 }
 
-type textCPMarshaler []byte
+type textCP []byte
 
-func (cm textCPMarshaler) MarshalText() ([]byte, error) {
-	cm = append(cm, '_')
-	return cm, nil
+func (cu textCP) MarshalText() ([]byte, error) {
+	return []byte(cu), nil
 }
 
-type binCPMarshaler []byte
-
-func (cm binCPMarshaler) MarshalBinary() ([]byte, error) {
-	cm = append(cm, '_')
-	return cm, nil
-}
-
-func TestAnyMarshal(t *T) {
-	type encodeTest struct {
-		in               interface{}
-		out              string
-		forceStr, flat   bool
-		expErr           bool
-		expErrConnUsable bool
-	}
-
-	var encodeTests = []encodeTest{
-		// Bulk strings
-		{in: []byte("ohey"), out: "$4\r\nohey\r\n"},
-		{in: "ohey", out: "$4\r\nohey\r\n"},
-		{in: "", out: "$0\r\n\r\n"},
-		{in: true, out: "$1\r\n1\r\n"},
-		{in: false, out: "$1\r\n0\r\n"},
-		{in: nil, out: "$-1\r\n"},
-		{in: nil, forceStr: true, out: "$0\r\n\r\n"},
-		{in: []byte(nil), out: "$-1\r\n"},
-		{in: []byte(nil), forceStr: true, out: "$0\r\n\r\n"},
-		{in: float32(5.5), out: "$3\r\n5.5\r\n"},
-		{in: float64(5.5), out: "$3\r\n5.5\r\n"},
-		{in: textCPMarshaler("ohey"), out: "$5\r\nohey_\r\n"},
-		{in: binCPMarshaler("ohey"), out: "$5\r\nohey_\r\n"},
-		{in: "ohey", flat: true, out: "$4\r\nohey\r\n"},
-
-		// Number
-		{in: 5, out: ":5\r\n"},
-		{in: int64(5), out: ":5\r\n"},
-		{in: uint64(5), out: ":5\r\n"},
-		{in: int64(5), forceStr: true, out: "$1\r\n5\r\n"},
-		{in: uint64(5), forceStr: true, out: "$1\r\n5\r\n"},
-
-		// Error
-		{in: errors.New(":("), out: "-:(\r\n"},
-		{in: errors.New(":("), forceStr: true, out: "$2\r\n:(\r\n"},
-
-		// Simple arrays
-		{in: []string(nil), out: "*-1\r\n"},
-		{in: []string(nil), flat: true, out: ""},
-		{in: []string{}, out: "*0\r\n"},
-		{in: []string{}, flat: true, out: ""},
-		{in: []string{"a", "b"}, out: "*2\r\n$1\r\na\r\n$1\r\nb\r\n"},
-		{in: []int{1, 2}, out: "*2\r\n:1\r\n:2\r\n"},
-		{in: []int{1, 2}, flat: true, out: ":1\r\n:2\r\n"},
-		{in: []int{1, 2}, forceStr: true, out: "*2\r\n$1\r\n1\r\n$1\r\n2\r\n"},
-		{in: []int{1, 2}, flat: true, forceStr: true, out: "$1\r\n1\r\n$1\r\n2\r\n"},
-
-		// Complex arrays
-		{in: []interface{}{}, out: "*0\r\n"},
-		{in: []interface{}{"a", 1}, out: "*2\r\n$1\r\na\r\n:1\r\n"},
-		{
-			in:       []interface{}{"a", 1},
-			forceStr: true,
-			out:      "*2\r\n$1\r\na\r\n$1\r\n1\r\n",
-		},
-		{
-			in:       []interface{}{"a", 1},
-			forceStr: true,
-			flat:     true,
-			out:      "$1\r\na\r\n$1\r\n1\r\n",
-		},
-		{
-			in:     []interface{}{func() {}},
-			expErr: true,
-		},
-		{
-			in:               []interface{}{func() {}},
-			flat:             true,
-			expErr:           true,
-			expErrConnUsable: true,
-		},
-		{
-			in:     []interface{}{"a", func() {}},
-			flat:   true,
-			expErr: true,
-		},
-
-		// Embedded arrays
-		{
-			in:  []interface{}{[]string{"a", "b"}, []int{1, 2}},
-			out: "*2\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n*2\r\n:1\r\n:2\r\n",
-		},
-		{
-			in:   []interface{}{[]string{"a", "b"}, []int{1, 2}},
-			flat: true,
-			out:  "$1\r\na\r\n$1\r\nb\r\n:1\r\n:2\r\n",
-		},
-		{
-			in: []interface{}{
-				[]interface{}{"a"},
-				[]interface{}{"b", func() {}},
-			},
-			expErr: true,
-		},
-		{
-			in: []interface{}{
-				[]interface{}{"a"},
-				[]interface{}{"b", func() {}},
-			},
-			flat:   true,
-			expErr: true,
-		},
-		{
-			in: []interface{}{
-				[]interface{}{func() {}, "a"},
-				[]interface{}{"b", func() {}},
-			},
-			flat:             true,
-			expErr:           true,
-			expErrConnUsable: true,
-		},
-
-		// Maps
-		{in: map[string]int(nil), out: "*-1\r\n"},
-		{in: map[string]int(nil), flat: true, out: ""},
-		{in: map[string]int{}, out: "*0\r\n"},
-		{in: map[string]int{}, flat: true, out: ""},
-		{in: map[string]int{"one": 1}, out: "*2\r\n$3\r\none\r\n:1\r\n"},
-		{
-			in:  map[string]interface{}{"one": []byte("1")},
-			out: "*2\r\n$3\r\none\r\n$1\r\n1\r\n",
-		},
-		{
-			in:  map[string]interface{}{"one": []string{"1", "2"}},
-			out: "*2\r\n$3\r\none\r\n*2\r\n$1\r\n1\r\n$1\r\n2\r\n",
-		},
-		{
-			in:   map[string]interface{}{"one": []string{"1", "2"}},
-			flat: true,
-			out:  "$3\r\none\r\n$1\r\n1\r\n$1\r\n2\r\n",
-		},
-		{
-			in:     map[string]interface{}{"one": func() {}},
-			expErr: true,
-		},
-		{
-			in:     map[string]interface{}{"one": func() {}},
-			flat:   true,
-			expErr: true,
-		},
-		{
-			in:     map[complex128]interface{}{0: func() {}},
-			expErr: true,
-		},
-		{
-			in:               map[complex128]interface{}{0: func() {}},
-			flat:             true,
-			expErr:           true,
-			expErrConnUsable: true,
-		},
-
-		// Structs
-		{
-			in: testStructA{
-				testStructInner: testStructInner{
-					Foo: 1,
-					bar: 2,
-					Baz: "3",
-					Buz: "4",
-					Boz: intPtr(5),
-				},
-				Biz: []byte("10"),
-			},
-			out: "*8\r\n" +
-				"$3\r\nFoo\r\n" + ":1\r\n" +
-				"$3\r\nBAZ\r\n" + "$1\r\n3\r\n" +
-				"$3\r\nBoz\r\n" + ":5\r\n" +
-				"$3\r\nBiz\r\n" + "$2\r\n10\r\n",
-		},
-		{
-			in: testStructB{
-				testStructInner: &testStructInner{
-					Foo: 1,
-					bar: 2,
-					Baz: "3",
-					Buz: "4",
-					Boz: intPtr(5),
-				},
-				Biz: []byte("10"),
-			},
-			out: "*8\r\n" +
-				"$3\r\nFoo\r\n" + ":1\r\n" +
-				"$3\r\nBAZ\r\n" + "$1\r\n3\r\n" +
-				"$3\r\nBoz\r\n" + ":5\r\n" +
-				"$3\r\nBiz\r\n" + "$2\r\n10\r\n",
-		},
-		{
-			in:  testStructB{Biz: []byte("10")},
-			out: "*2\r\n" + "$3\r\nBiz\r\n" + "$2\r\n10\r\n",
-		},
-		{
-			in:  testStructC{},
-			out: "*2\r\n" + "$3\r\nBiz\r\n" + "$0\r\n\r\n",
-		},
-	}
-
-	for i, et := range encodeTests {
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			buf := new(bytes.Buffer)
-			a := Any{
-				I:                     et.in,
-				MarshalBlobString:     et.forceStr,
-				MarshalNoArrayHeaders: et.flat,
-			}
-
-			err := a.MarshalRESP(buf)
-			var errConnUsable resp.ErrConnUsable
-			if et.expErr && err == nil {
-				t.Fatal("expected error")
-			} else if et.expErr && et.expErrConnUsable != errors.As(err, &errConnUsable) {
-				t.Fatalf("expected ErrConnUsable:%v, got: %v", et.expErrConnUsable, err)
-			} else if !et.expErr {
-				assert.Nil(t, err)
-			}
-
-			if !et.expErr {
-				assert.Equal(t, et.out, buf.String(), "et: %#v", et)
-			}
-		})
-	}
-}
-
-type textCPUnmarshaler []byte
-
-func (cu *textCPUnmarshaler) UnmarshalText(b []byte) error {
+func (cu *textCP) UnmarshalText(b []byte) error {
 	*cu = (*cu)[:0]
 	*cu = append(*cu, b...)
 	return nil
 }
 
-type binCPUnmarshaler []byte
+type binCP []byte
 
-func (cu *binCPUnmarshaler) UnmarshalBinary(b []byte) error {
+func (cu binCP) MarshalBinary() ([]byte, error) {
+	return []byte(cu), nil
+}
+
+func (cu *binCP) UnmarshalBinary(b []byte) error {
 	*cu = (*cu)[:0]
 	*cu = append(*cu, b...)
 	return nil
 }
 
-type lowerCaseUnmarshaler string
+type streamedStrRW [][]byte
 
-func (lcu *lowerCaseUnmarshaler) UnmarshalRESP(br *bufio.Reader) error {
-	var bs BlobString
-	if err := bs.UnmarshalRESP(br); err != nil {
-		return err
+func (rw *streamedStrRW) Write(b []byte) (int, error) {
+	rwB := append([]byte(nil), b...)
+	*rw = append(*rw, rwB)
+	return len(rwB), nil
+}
+
+func (rw streamedStrRW) Read(b []byte) (int, error) {
+	// this method jumps through a lot of hoops to not have a pointer receiver,
+	// because that makes formulating the tests easier.
+	if len(rw) == 0 || len(rw[0]) == 0 {
+		return 0, io.EOF
 	}
-	*lcu = lowerCaseUnmarshaler(strings.ToLower(bs.S))
+
+	rwB := rw[0]
+	if len(b) < len(rwB) {
+		panic("length of byte slice being read into is smaller than what needs to be written")
+	}
+	copy(b, rwB)
+	copy(rw, rw[1:])
+	rw[len(rw)-1] = []byte{}
+	return len(rwB), nil
+}
+
+type msgSeries []interface {
+	resp.Marshaler
+	resp.Unmarshaler
+}
+
+func (s msgSeries) MarshalRESP(w io.Writer) error {
+	for i := range s {
+		if err := s[i].MarshalRESP(w); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-type upperCaseUnmarshaler string
-
-func (ucu *upperCaseUnmarshaler) UnmarshalRESP(br *bufio.Reader) error {
-	var bs BlobString
-	if err := bs.UnmarshalRESP(br); err != nil {
-		return err
+func (s msgSeries) UnmarshalRESP(br *bufio.Reader) error {
+	for i := range s {
+		if err := s[i].UnmarshalRESP(br); err != nil {
+			return err
+		}
 	}
-	*ucu = upperCaseUnmarshaler(strings.ToUpper(bs.S))
 	return nil
 }
 
-type writer []byte
+type ie [2]interface{} // into/expect
 
-func (w *writer) Write(b []byte) (int, error) {
-	*w = append(*w, b...)
-	return len(b), nil
+type kase struct { // "case" is reserved
+	label string
+
+	// for each kase the input message will be unmarshaled into the first
+	// interface{} (the "into") and then compared with the second (the
+	// "expected").
+	ie ie
+
+	// reverseable, also test AnyMarshaler
+	r bool
+
+	// flatStrEmpty indicates that when marshaling as a flat string (see
+	// msgAsFlatStr) the result is expected to be empty. This is only useful in
+	// some very specific cases, notably nil slices/maps/structs.
+	flatStrEmpty bool
 }
 
-func TestAnyUnmarshal(t *T) {
-	type decodeTest struct {
-		in  string
-		out interface{}
+type in struct {
+	// label is optional and is used to sometimes make generating cases easier
+	label string
 
-		// Instead of unmarshalling into a zero-value of out's type, unmarshal
-		// into a copy of this, then compare with out
-		preload interface{}
+	// msg is the actual RESP message being unmarshaled
+	msg string
 
-		// like preload, but explicitly preload with a pointer to an empty
-		// interface
-		preloadEmpty bool
+	// msgAsFlatStr is the msg having been flattened and all non-agg elements
+	// turned into blob strings.
+	msgAsFlatStr string
 
-		// instead of testing out, test that unmarshal returns an error
-		shouldErr string
+	// mkCases generates the test cases specific to this particular input.
+	mkCases func() []kase
+}
+
+func (in in) expNumElems() int {
+	var numElems int
+	buf := bytes.NewBufferString(in.msgAsFlatStr)
+	br := bufio.NewReader(buf)
+	for {
+		if br.Buffered() == 0 && buf.Len() == 0 {
+			return numElems
+		} else if err := (Any{}).UnmarshalRESP(br); err != nil {
+			panic(err)
+		}
+		numElems++
+	}
+}
+
+func (in in) prefix() Prefix {
+	return Prefix(in.msg[0])
+}
+
+func (in in) streamed() bool {
+	return in.msg[1] == '?'
+}
+
+type unmarshalMarshalTest struct {
+	descr string
+	ins   []in
+
+	// mkCases generates a set of cases in a generic way for each in (useful
+	// for cases which are identical or only slightly different across all
+	// ins).
+	mkCases func(in) []kase
+
+	// instead of testing cases, assert that unmarshal returns this specific
+	// error.
+	shouldErr error
+}
+
+func (umt unmarshalMarshalTest) cases(in in) []kase {
+	var cases []kase
+	if in.mkCases != nil {
+		cases = append(cases, in.mkCases()...)
+	}
+	if umt.mkCases != nil {
+		cases = append(cases, umt.mkCases(in)...)
+	}
+	for i := range cases {
+		if cases[i].label == "" {
+			cases[i].label = fmt.Sprintf("case%d", i)
+		}
+	}
+	return cases
+}
+
+func TestAnyUnmarshalMarshal(t *T) {
+
+	strPtr := func(s string) *string { return &s }
+	bytPtr := func(b []byte) *[]byte { return &b }
+	intPtr := func(i int64) *int64 { return &i }
+	fltPtr := func(f float64) *float64 { return &f }
+
+	setReversable := func(to bool, kk []kase) []kase {
+		for i := range kk {
+			kk[i].r = to
+		}
+		return kk
 	}
 
-	decodeTests := []decodeTest{
-		// Bulk string
-		{in: "$-1\r\n", out: []byte(nil)},
-		{in: "$-1\r\n", preload: []byte{1}, out: []byte(nil)},
-		{in: "$-1\r\n", preloadEmpty: true, out: []byte(nil)},
-		{in: "$0\r\n\r\n", out: ""},
-		{in: "$0\r\n\r\n", out: []byte(nil)},
-		{in: "$4\r\nohey\r\n", out: "ohey"},
-		{in: "$4\r\nohey\r\n", out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", preload: []byte(nil), out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", preload: []byte(""), out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", preload: []byte("wut"), out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", preload: []byte("wutwut"), out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", out: textCPUnmarshaler("ohey")},
-		{in: "$4\r\nohey\r\n", out: binCPUnmarshaler("ohey")},
-		{in: "$4\r\nohey\r\n", out: writer("ohey")},
-		{in: "$2\r\n10\r\n", out: int(10)},
-		{in: "$2\r\n10\r\n", out: uint(10)},
-		{in: "$4\r\n10.5\r\n", out: float32(10.5)},
-		{in: "$4\r\n10.5\r\n", out: float64(10.5)},
-		{in: "$4\r\nohey\r\n", preloadEmpty: true, out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", out: nil},
+	strCases := func(in in, str string) []kase {
+		prefix := in.prefix()
+		kases := setReversable(prefix == BlobStringPrefix, []kase{
+			{ie: ie{"", str}},
+			{ie: ie{"otherstring", str}},
+			{ie: ie{(*string)(nil), strPtr(str)}},
+			{ie: ie{strPtr(""), strPtr(str)}},
+			{ie: ie{strPtr("otherstring"), strPtr(str)}},
+			{ie: ie{[]byte{}, []byte(str)}},
+			{ie: ie{[]byte(nil), []byte(str)}},
+			{ie: ie{[]byte("f"), []byte(str)}},
+			{ie: ie{[]byte("biglongstringblaaaaah"), []byte(str)}},
+			{ie: ie{(*[]byte)(nil), bytPtr([]byte(str))}},
+			{ie: ie{bytPtr(nil), bytPtr([]byte(str))}},
+			{ie: ie{bytPtr([]byte("f")), bytPtr([]byte(str))}},
+			{ie: ie{bytPtr([]byte("biglongstringblaaaaah")), bytPtr([]byte(str))}},
+			{ie: ie{textCP{}, textCP(str)}},
+			{ie: ie{binCP{}, binCP(str)}},
+			{ie: ie{new(bytes.Buffer), bytes.NewBufferString(str)}},
+		})
+		if prefix == BlobStringPrefix && !in.streamed() {
+			kases = append(kases, setReversable(true, []kase{
+				{ie: ie{BlobString{S: ""}, BlobString{S: str}}},
+				{ie: ie{BlobString{S: "f"}, BlobString{S: str}}},
+				{ie: ie{BlobString{S: "biglongstringblaaaaah"}, BlobString{S: str}}},
+				{ie: ie{BlobStringBytes{B: nil}, BlobStringBytes{B: []byte(str)}}},
+				{ie: ie{BlobStringBytes{B: []byte{}}, BlobStringBytes{B: []byte(str)}}},
+				{ie: ie{BlobStringBytes{B: []byte("f")}, BlobStringBytes{B: []byte(str)}}},
+				{ie: ie{BlobStringBytes{B: []byte("biglongstringblaaaaah")}, BlobStringBytes{B: []byte(str)}}},
+			})...)
+		} else if prefix == SimpleStringPrefix {
+			kases = append(kases, setReversable(true, []kase{
+				{ie: ie{SimpleString{S: ""}, SimpleString{S: str}}},
+				{ie: ie{SimpleString{S: "f"}, SimpleString{S: str}}},
+				{ie: ie{SimpleString{S: "biglongstringblaaaaah"}, SimpleString{S: str}}},
+			})...)
+		}
+		return kases
+	}
 
-		// Simple string
-		{in: "+\r\n", out: ""},
-		{in: "+\r\n", out: []byte(nil)},
-		{in: "+ohey\r\n", out: "ohey"},
-		{in: "+ohey\r\n", out: []byte("ohey")},
-		{in: "+ohey\r\n", out: textCPUnmarshaler("ohey")},
-		{in: "+ohey\r\n", out: binCPUnmarshaler("ohey")},
-		{in: "+ohey\r\n", out: writer("ohey")},
-		{in: "+10\r\n", out: int(10)},
-		{in: "+10\r\n", out: uint(10)},
-		{in: "+10.5\r\n", out: float32(10.5)},
-		{in: "+10.5\r\n", out: float64(10.5)},
-		{in: "+ohey\r\n", preloadEmpty: true, out: "ohey"},
-		{in: "+ohey\r\n", out: nil},
+	floatCases := func(in in, f float64) []kase {
+		prefix := in.prefix()
+		kases := setReversable(prefix == DoublePrefix, []kase{
+			{ie: ie{float32(0), float32(f)}},
+			{ie: ie{float32(1), float32(f)}},
+			{ie: ie{float64(0), float64(f)}},
+			{ie: ie{float64(1), float64(f)}},
+			{ie: ie{(*float64)(nil), fltPtr(f)}},
+			{ie: ie{fltPtr(0), fltPtr(f)}},
+			{ie: ie{fltPtr(1), fltPtr(f)}},
+			{ie: ie{new(big.Float), new(big.Float).SetFloat64(f)}},
+		})
+		kases = append(kases, []kase{
+			{r: prefix == BooleanPrefix, ie: ie{false, f != 0}},
+		}...)
+		if prefix == DoublePrefix {
+			kases = append(kases, setReversable(true, []kase{
+				{ie: ie{Double{F: 0}, Double{F: f}}},
+				{ie: ie{Double{F: 1.5}, Double{F: f}}},
+				{ie: ie{Double{F: -1.5}, Double{F: f}}},
+				{ie: ie{Double{F: math.Inf(1)}, Double{F: f}}},
+				{ie: ie{Double{F: math.Inf(-1)}, Double{F: f}}},
+			})...)
 
-		// Err
-		{in: "-ohey\r\n", out: "", shouldErr: "ohey"},
-		{in: "-ohey\r\n", out: nil, shouldErr: "ohey"},
+		} else if prefix == BooleanPrefix {
+			kases = append(kases, setReversable(true, []kase{
+				{ie: ie{Boolean{B: false}, Boolean{B: f != 0}}},
+				{ie: ie{Boolean{B: true}, Boolean{B: f != 0}}},
+			})...)
+		}
+		return kases
+	}
 
-		// Number
-		{in: ":1024\r\n", out: "1024"},
-		{in: ":1024\r\n", out: []byte("1024")},
-		{in: ":1024\r\n", out: textCPUnmarshaler("1024")},
-		{in: ":1024\r\n", out: binCPUnmarshaler("1024")},
-		{in: ":1024\r\n", out: writer("1024")},
-		{in: ":1024\r\n", out: int(1024)},
-		{in: ":1024\r\n", out: uint(1024)},
-		{in: ":1024\r\n", out: float32(1024)},
-		{in: ":1024\r\n", out: float64(1024)},
-		{in: ":1024\r\n", preloadEmpty: true, out: int64(1024)},
-		{in: ":1024\r\n", out: nil},
+	intCases := func(in in, i int64) []kase {
+		prefix := in.prefix()
+		kases := floatCases(in, float64(i))
+		kases = append(kases, setReversable(prefix == NumberPrefix, []kase{
+			{ie: ie{int(0), int(i)}},
+			{ie: ie{int8(0), int8(i)}},
+			{ie: ie{int16(0), int16(i)}},
+			{ie: ie{int32(0), int32(i)}},
+			{ie: ie{int64(0), int64(i)}},
+			{ie: ie{int(1), int(i)}},
+			{ie: ie{int8(1), int8(i)}},
+			{ie: ie{int16(1), int16(i)}},
+			{ie: ie{int32(1), int32(i)}},
+			{ie: ie{int64(1), int64(i)}},
+			{ie: ie{(*int64)(nil), intPtr(i)}},
+			{ie: ie{intPtr(0), intPtr(i)}},
+			{ie: ie{intPtr(1), intPtr(i)}},
+		})...)
 
-		// Arrays
-		{in: "*-1\r\n", out: []interface{}(nil)},
-		{in: "*-1\r\n", out: []string(nil)},
-		{in: "*-1\r\n", out: map[string]string(nil)},
-		{in: "*-1\r\n", preloadEmpty: true, out: []interface{}(nil)},
-		{in: "*0\r\n", out: []interface{}{}},
-		{in: "*0\r\n", out: []string{}},
-		{in: "*0\r\n", preload: map[string]string(nil), out: map[string]string{}},
-		{in: "*2\r\n+foo\r\n+bar\r\n", out: []string{"foo", "bar"}},
-		{in: "*2\r\n+foo\r\n+bar\r\n", out: []interface{}{"foo", "bar"}},
-		{in: "*2\r\n+foo\r\n+bar\r\n", preloadEmpty: true, out: []interface{}{"foo", "bar"}},
-		{in: "*2\r\n+foo\r\n+5\r\n", preload: []interface{}{0, 1}, out: []interface{}{"foo", "5"}},
-		{
-			in: "*2\r\n*2\r\n+foo\r\n+bar\r\n*1\r\n+baz\r\n",
-			out: []interface{}{
-				[]interface{}{"foo", "bar"},
-				[]interface{}{"baz"},
+		kases = append(kases, []kase{
+			{
+				ie: ie{new(big.Int), new(big.Int).SetInt64(i)},
+				r:  prefix == BigNumberPrefix,
 			},
-		},
-		{
-			in:  "*2\r\n*2\r\n+foo\r\n+bar\r\n*1\r\n+baz\r\n",
-			out: [][]string{{"foo", "bar"}, {"baz"}},
-		},
-		{
-			in:  "*2\r\n*2\r\n+foo\r\n+bar\r\n+baz\r\n",
-			out: []interface{}{[]interface{}{"foo", "bar"}, "baz"},
-		},
-		{in: "*2\r\n:1\r\n:2\r\n", out: map[string]string{"1": "2"}},
-		{in: "*2\r\n*2\r\n+foo\r\n+bar\r\n*1\r\n+baz\r\n", out: nil},
-		{
-			in: "*6\r\n" +
-				"$3\r\none\r\n" + "*2\r\n$1\r\n!\r\n$1\r\n1\r\n" +
-				"$3\r\ntwo\r\n" + "*2\r\n$2\r\n!!\r\n$1\r\n2\r\n" +
-				"$5\r\nthree\r\n" + "*2\r\n$3\r\n!!!\r\n$1\r\n3\r\n",
-			out: map[string]map[string]int{
-				"one":   {"!": 1},
-				"two":   {"!!": 2},
-				"three": {"!!!": 3},
-			},
-		},
-		{
-			in: "*4\r\n" +
-				"$5\r\nhElLo\r\n" + "$5\r\nWoRlD\r\n" +
-				"$3\r\nFoO\r\n" + "$3\r\nbAr\r\n",
-			out: map[upperCaseUnmarshaler]lowerCaseUnmarshaler{
-				"HELLO": "world",
-				"FOO":   "bar",
-			},
-		},
+		}...)
 
-		// Arrays (structs)
+		if i >= 0 {
+			kases = append(kases, setReversable(prefix == NumberPrefix, []kase{
+				{ie: ie{uint(0), uint(i)}},
+				{ie: ie{uint8(0), uint8(i)}},
+				{ie: ie{uint16(0), uint16(i)}},
+				{ie: ie{uint32(0), uint32(i)}},
+				{ie: ie{uint64(0), uint64(i)}},
+				{ie: ie{uint(1), uint(i)}},
+				{ie: ie{uint8(1), uint8(i)}},
+				{ie: ie{uint16(1), uint16(i)}},
+				{ie: ie{uint32(1), uint32(i)}},
+				{ie: ie{uint64(1), uint64(i)}},
+			})...)
+		}
+
+		if prefix == NumberPrefix {
+			kases = append(kases, setReversable(true, []kase{
+				{ie: ie{Number{N: 5}, Number{N: i}}},
+				{ie: ie{Number{N: 0}, Number{N: i}}},
+				{ie: ie{Number{N: -5}, Number{N: i}}},
+			})...)
+
+		} else if prefix == BigNumberPrefix {
+			kases = append(kases, setReversable(true, []kase{
+				{ie: ie{BigNumber{I: new(big.Int)}, BigNumber{I: new(big.Int).SetInt64(i)}}},
+				{ie: ie{BigNumber{I: new(big.Int).SetInt64(1)}, BigNumber{I: new(big.Int).SetInt64(i)}}},
+				{ie: ie{BigNumber{I: new(big.Int).SetInt64(-1)}, BigNumber{I: new(big.Int).SetInt64(i)}}},
+			})...)
+		}
+
+		return kases
+	}
+
+	nullCases := func(in in) []kase {
+		cases := []kase{
+			{ie: ie{[]byte(nil), []byte(nil)}},
+			{ie: ie{[]byte{}, []byte(nil)}},
+			{ie: ie{[]byte{1}, []byte(nil)}},
+		}
+		cases = append(cases, setReversable(in.prefix() == NullPrefix, []kase{
+			{flatStrEmpty: true, ie: ie{[]string(nil), []string(nil)}},
+			{flatStrEmpty: true, ie: ie{[]string{}, []string(nil)}},
+			{flatStrEmpty: true, ie: ie{[]string{"ohey"}, []string(nil)}},
+			{flatStrEmpty: true, ie: ie{map[string]string(nil), map[string]string(nil)}},
+			{flatStrEmpty: true, ie: ie{map[string]string{}, map[string]string(nil)}},
+			{flatStrEmpty: true, ie: ie{map[string]string{"a": "b"}, map[string]string(nil)}},
+			{ie: ie{(*int64)(nil), (*int64)(nil)}},
+			{ie: ie{intPtr(0), (*int64)(nil)}},
+			{ie: ie{intPtr(1), (*int64)(nil)}},
+			{flatStrEmpty: true, ie: ie{(*testStructA)(nil), (*testStructA)(nil)}},
+			{flatStrEmpty: true, ie: ie{&testStructA{}, (*testStructA)(nil)}},
+			{ie: ie{Null{}, Null{}}},
+		})...)
+		return cases
+	}
+
+	unmarshalMarshalTests := []unmarshalMarshalTest{
 		{
-			in: "*10\r\n" +
-				"$3\r\nBAZ\r\n" + "$1\r\n3\r\n" +
-				"$3\r\nFoo\r\n" + ":1\r\n" +
-				"$3\r\nBoz\r\n" + ":100\r\n" +
-				"$3\r\nDNE\r\n" + ":1000\r\n" +
-				"$3\r\nBiz\r\n" + "$1\r\n5\r\n",
-			out: testStructA{
-				testStructInner: testStructInner{
-					Foo: 1,
-					Baz: "3",
-					Boz: intPtr(100),
+			descr: "empty blob string",
+			ins: []in{{
+				msg:          "$0\r\n\r\n",
+				msgAsFlatStr: "$0\r\n\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []byte{}}, r: true}}
 				},
-				Biz: []byte("5"),
+			}},
+			mkCases: func(in in) []kase { return strCases(in, "") },
+		},
+		{
+			descr: "blob string",
+			ins: []in{{
+				msg:          "$4\r\nohey\r\n",
+				msgAsFlatStr: "$4\r\nohey\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []byte("ohey")}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return strCases(in, "ohey") },
+		},
+		{
+			descr: "integer blob string",
+			ins: []in{{
+				msg:          "$2\r\n10\r\n",
+				msgAsFlatStr: "$2\r\n10\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []byte("10")}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "10"), intCases(in, 10)...) },
+		},
+		{
+			descr: "float blob string",
+			ins: []in{{
+				msg:          "$4\r\n10.5\r\n",
+				msgAsFlatStr: "$4\r\n10.5\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []byte("10.5")}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "10.5"), floatCases(in, 10.5)...) },
+		},
+		{
+			// only for backwards compatibility
+			descr: "null blob string",
+			ins: []in{{
+				msg:          "$-1\r\n",
+				msgAsFlatStr: "$0\r\n\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []byte(nil)}, r: false}}
+				},
+			}},
+			mkCases: func(in in) []kase { return nullCases(in) },
+		},
+		{
+			descr: "blob string with delim",
+			ins: []in{{
+				msg:          "$6\r\nab\r\ncd\r\n",
+				msgAsFlatStr: "$6\r\nab\r\ncd\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []byte("ab\r\ncd")}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return strCases(in, "ab\r\ncd") },
+		},
+		{
+			descr: "empty simple string",
+			ins: []in{{
+				msg:          "+\r\n",
+				msgAsFlatStr: "$0\r\n\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, ""}, r: false}}
+				},
+			}},
+			mkCases: func(in in) []kase { return strCases(in, "") },
+		},
+		{
+			descr: "simple string",
+			ins: []in{{
+				msg:          "+ohey\r\n",
+				msgAsFlatStr: "$4\r\nohey\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, "ohey"}, r: false}}
+				},
+			}},
+			mkCases: func(in in) []kase { return strCases(in, "ohey") },
+		},
+		{
+			descr: "integer simple string",
+			ins: []in{{
+				msg:          "+10\r\n",
+				msgAsFlatStr: "$2\r\n10\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, "10"}, r: false}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "10"), intCases(in, 10)...) },
+		},
+		{
+			descr: "float simple string",
+			ins: []in{{
+				msg:          "+10.5\r\n",
+				msgAsFlatStr: "$4\r\n10.5\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, "10.5"}, r: false}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "10.5"), floatCases(in, 10.5)...) },
+		},
+		{
+			descr: "empty simple error",
+			ins: []in{{
+				msg:          "-\r\n",
+				msgAsFlatStr: "$0\r\n\r\n",
+			}},
+			shouldErr: resp.ErrConnUsable{Err: SimpleError{S: ""}},
+		},
+		{
+			descr: "simple error",
+			ins: []in{{
+				msg:          "-ohey\r\n",
+				msgAsFlatStr: "$4\r\nohey\r\n",
+			}},
+			shouldErr: resp.ErrConnUsable{Err: SimpleError{S: "ohey"}},
+		},
+		{
+			descr: "zero number",
+			ins: []in{{
+				msg:          ":0\r\n",
+				msgAsFlatStr: "$1\r\n0\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, int64(0)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "0"), intCases(in, 0)...) },
+		},
+		{
+			descr: "positive number",
+			ins: []in{{
+				msg:          ":10\r\n",
+				msgAsFlatStr: "$2\r\n10\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, int64(10)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "10"), intCases(in, 10)...) },
+		},
+		{
+			descr: "negative number",
+			ins: []in{{
+				msg:          ":-10\r\n",
+				msgAsFlatStr: "$3\r\n-10\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, int64(-10)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "-10"), intCases(in, -10)...) },
+		},
+		{
+			descr: "null",
+			ins: []in{{
+				msg:          "_\r\n",
+				msgAsFlatStr: "$0\r\n\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, nil}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return nullCases(in) },
+		},
+		{
+			descr: "zero double",
+			ins: []in{{
+				msg:          ",0\r\n",
+				msgAsFlatStr: "$1\r\n0\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, float64(0)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "0"), floatCases(in, 0)...) },
+		},
+		{
+			descr: "positive double",
+			ins: []in{{
+				msg:          ",10.5\r\n",
+				msgAsFlatStr: "$4\r\n10.5\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, float64(10.5)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "10.5"), floatCases(in, 10.5)...) },
+		},
+		{
+			descr: "positive double infinity",
+			ins: []in{{
+				msg:          ",inf\r\n",
+				msgAsFlatStr: "$3\r\ninf\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, math.Inf(1)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "inf"), floatCases(in, math.Inf(1))...) },
+		},
+		{
+			descr: "negative double",
+			ins: []in{{
+				msg:          ",-10.5\r\n",
+				msgAsFlatStr: "$5\r\n-10.5\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, float64(-10.5)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "-10.5"), floatCases(in, -10.5)...) },
+		},
+		{
+			descr: "negative double infinity",
+			ins: []in{{
+				msg:          ",-inf\r\n",
+				msgAsFlatStr: "$4\r\n-inf\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, math.Inf(-1)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase {
+				return append(strCases(in, "-inf"), floatCases(in, math.Inf(-1))...)
 			},
 		},
 		{
-			in: "*10\r\n" +
-				"$3\r\nBAZ\r\n" + "$1\r\n3\r\n" +
-				"$3\r\nBiz\r\n" + "$1\r\n5\r\n" +
-				"$3\r\nBoz\r\n" + ":100\r\n" +
-				"$3\r\nDNE\r\n" + ":1000\r\n" +
-				"$3\r\nFoo\r\n" + ":1\r\n",
-			preload: testStructB{testStructInner: new(testStructInner)},
-			out: testStructB{
-				testStructInner: &testStructInner{
-					Foo: 1,
-					Baz: "3",
-					Boz: intPtr(100),
+			descr: "true",
+			ins: []in{{
+				msg:          "#t\r\n",
+				msgAsFlatStr: "$1\r\n1\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, true}, r: true}}
 				},
-				Biz: []byte("5"),
+			}},
+			// intCases will include actually unmarshaling into a bool
+			mkCases: func(in in) []kase { return append(strCases(in, "1"), intCases(in, 1)...) },
+		},
+		{
+			descr: "false",
+			ins: []in{{
+				msg:          "#f\r\n",
+				msgAsFlatStr: "$1\r\n0\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, false}, r: true}}
+				},
+			}},
+			// intCases will include actually unmarshaling into a bool
+			mkCases: func(in in) []kase { return append(strCases(in, "0"), intCases(in, 0)...) },
+		},
+		{
+			descr: "empty blob error",
+			ins: []in{{
+				msg:          "!0\r\n\r\n",
+				msgAsFlatStr: "$0\r\n\r\n",
+			}},
+			shouldErr: resp.ErrConnUsable{Err: BlobError{B: []byte{}}},
+		},
+		{
+			descr: "blob error",
+			ins: []in{{
+				msg:          "!4\r\nohey\r\n",
+				msgAsFlatStr: "$4\r\nohey\r\n",
+			}},
+			shouldErr: resp.ErrConnUsable{Err: BlobError{B: []byte("ohey")}},
+		},
+		{
+			descr: "blob error with delim",
+			ins: []in{{
+				msg:          "!6\r\noh\r\ney\r\n",
+				msgAsFlatStr: "$6\r\noh\r\ney\r\n",
+			}},
+			shouldErr: resp.ErrConnUsable{Err: BlobError{B: []byte("oh\r\ney")}},
+		},
+		{
+			descr: "empty verbatim string",
+			ins: []in{{
+				msg:          "=4\r\ntxt:\r\n",
+				msgAsFlatStr: "$0\r\n\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []byte("")}, r: false}}
+				},
+			}},
+			mkCases: func(in in) []kase {
+				cases := strCases(in, "")
+				cases = append(cases, setReversable(true, []kase{
+					{ie: ie{VerbatimString{}, VerbatimString{Format: "txt"}}},
+					{ie: ie{
+						VerbatimString{Format: "foo", S: "bar"},
+						VerbatimString{Format: "txt"},
+					}},
+					{ie: ie{VerbatimStringBytes{}, VerbatimStringBytes{Format: []byte("txt"), B: []byte{}}}},
+					{ie: ie{
+						VerbatimStringBytes{Format: []byte("foo"), B: []byte("bar")},
+						VerbatimStringBytes{Format: []byte("txt"), B: []byte{}},
+					}},
+				})...)
+				return cases
+			},
+		},
+		{
+			descr: "verbatim string",
+			ins: []in{{
+				msg:          "=8\r\ntxt:ohey\r\n",
+				msgAsFlatStr: "$4\r\nohey\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []byte("ohey")}, r: false}}
+				},
+			}},
+			mkCases: func(in in) []kase {
+				cases := strCases(in, "ohey")
+				cases = append(cases, setReversable(true, []kase{
+					{ie: ie{
+						VerbatimString{},
+						VerbatimString{Format: "txt", S: "ohey"},
+					}},
+					{ie: ie{
+						VerbatimString{Format: "foo", S: "bar"},
+						VerbatimString{Format: "txt", S: "ohey"},
+					}},
+					{ie: ie{
+						VerbatimStringBytes{Format: []byte("foo"), B: []byte("bar")},
+						VerbatimStringBytes{Format: []byte("txt"), B: []byte("ohey")},
+					}},
+					{ie: ie{
+						VerbatimStringBytes{Format: []byte("foo"), B: []byte("bar")},
+						VerbatimStringBytes{Format: []byte("txt"), B: []byte("ohey")},
+					}},
+				})...)
+				return cases
+			},
+		},
+		{
+			descr: "verbatim string with delim",
+			ins: []in{{
+				msg:          "=10\r\ntxt:oh\r\ney\r\n",
+				msgAsFlatStr: "$6\r\noh\r\ney\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []byte("oh\r\ney")}, r: false}}
+				},
+			}},
+			mkCases: func(in in) []kase {
+				cases := strCases(in, "oh\r\ney")
+				cases = append(cases, setReversable(true, []kase{
+					{ie: ie{
+						VerbatimString{},
+						VerbatimString{Format: "txt", S: "oh\r\ney"},
+					}},
+					{ie: ie{
+						VerbatimString{Format: "foo", S: "bar"},
+						VerbatimString{Format: "txt", S: "oh\r\ney"},
+					}},
+					{ie: ie{
+						VerbatimStringBytes{Format: []byte("foo"), B: []byte("bar")},
+						VerbatimStringBytes{Format: []byte("txt"), B: []byte("oh\r\ney")},
+					}},
+					{ie: ie{
+						VerbatimStringBytes{Format: []byte("foo"), B: []byte("bar")},
+						VerbatimStringBytes{Format: []byte("txt"), B: []byte("oh\r\ney")},
+					}},
+				})...)
+				return cases
+			},
+		},
+		{
+			descr: "zero big number",
+			ins: []in{{
+				msg:          "(0\r\n",
+				msgAsFlatStr: "$1\r\n0\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, new(big.Int)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "0"), intCases(in, 0)...) },
+		},
+		{
+			descr: "positive big number",
+			ins: []in{{
+				msg:          "(1000\r\n",
+				msgAsFlatStr: "$4\r\n1000\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, new(big.Int).SetInt64(1000)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "1000"), intCases(in, 1000)...) },
+		},
+		{
+			descr: "negative big number",
+			ins: []in{{
+				msg:          "(-1000\r\n",
+				msgAsFlatStr: "$5\r\n-1000\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, new(big.Int).SetInt64(-1000)}, r: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return append(strCases(in, "-1000"), intCases(in, -1000)...) },
+		},
+		{
+			// only for backwards compatibility
+			descr: "null array",
+			ins: []in{{
+				msg:          "*-1\r\n",
+				msgAsFlatStr: "$0\r\n\r\n",
+				mkCases: func() []kase {
+					return []kase{{ie: ie{nil, []interface{}(nil)}, r: false, flatStrEmpty: true}}
+				},
+			}},
+			mkCases: func(in in) []kase { return nullCases(in) },
+		},
+		{
+			descr: "empty agg",
+			ins: []in{
+				{
+					msg:          "*0\r\n",
+					msgAsFlatStr: "",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, []interface{}{}}},
+							{ie: ie{ArrayHeader{}, ArrayHeader{}}},
+							{ie: ie{ArrayHeader{NumElems: 1}, ArrayHeader{}}},
+						})
+					},
+				},
+				{
+					msg:          "*?\r\n.\r\n",
+					msgAsFlatStr: "",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []interface{}{}}},
+							{r: true, ie: ie{
+								msgSeries{
+									&ArrayHeader{},
+									&StreamedAggregatedTypeEnd{},
+								},
+								msgSeries{
+									&ArrayHeader{StreamedArrayHeader: true},
+									&StreamedAggregatedTypeEnd{},
+								},
+							}},
+							{r: true, ie: ie{
+								msgSeries{
+									&ArrayHeader{NumElems: 5},
+									&StreamedAggregatedTypeEnd{},
+								},
+								msgSeries{
+									&ArrayHeader{StreamedArrayHeader: true},
+									&StreamedAggregatedTypeEnd{},
+								},
+							}},
+						}
+					},
+				},
+				{
+					msg:          "~0\r\n",
+					msgAsFlatStr: "",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, map[interface{}]struct{}{}}},
+							{ie: ie{SetHeader{}, SetHeader{}}},
+							{ie: ie{SetHeader{NumElems: 1}, SetHeader{}}},
+						})
+					},
+				},
+				{
+					msg:          "~?\r\n.\r\n",
+					msgAsFlatStr: "",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, map[interface{}]struct{}{}}},
+							{r: true, ie: ie{
+								msgSeries{
+									&SetHeader{},
+									&StreamedAggregatedTypeEnd{},
+								},
+								msgSeries{
+									&SetHeader{StreamedSetHeader: true},
+									&StreamedAggregatedTypeEnd{},
+								},
+							}},
+							{r: true, ie: ie{
+								msgSeries{
+									&SetHeader{NumElems: 5},
+									&StreamedAggregatedTypeEnd{},
+								},
+								msgSeries{
+									&SetHeader{StreamedSetHeader: true},
+									&StreamedAggregatedTypeEnd{},
+								},
+							}},
+						}
+					},
+				},
+				{
+					msg:          "%0\r\n",
+					msgAsFlatStr: "",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, map[interface{}]interface{}{}}},
+							{ie: ie{MapHeader{}, MapHeader{}}},
+							{ie: ie{MapHeader{NumPairs: 1}, MapHeader{}}},
+						})
+					},
+				},
+				{
+					msg:          "%?\r\n.\r\n",
+					msgAsFlatStr: "",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, map[interface{}]interface{}{}}},
+							{r: true, ie: ie{
+								msgSeries{
+									&MapHeader{},
+									&StreamedAggregatedTypeEnd{},
+								},
+								msgSeries{
+									&MapHeader{StreamedMapHeader: true},
+									&StreamedAggregatedTypeEnd{},
+								},
+							}},
+							{r: true, ie: ie{
+								msgSeries{
+									&MapHeader{NumPairs: 5},
+									&StreamedAggregatedTypeEnd{},
+								},
+								msgSeries{
+									&MapHeader{StreamedMapHeader: true},
+									&StreamedAggregatedTypeEnd{},
+								},
+							}},
+						}
+					},
+				},
+			},
+			mkCases: func(in in) []kase {
+				prefix := in.prefix()
+				streamed := in.streamed()
+				isArray := prefix == ArrayPrefix
+				isSet := prefix == SetPrefix
+				isMap := prefix == MapPrefix
+				return []kase{
+					{r: !streamed && isArray, ie: ie{[][]byte(nil), [][]byte{}}},
+					{r: !streamed && isArray, ie: ie{[][]byte{}, [][]byte{}}},
+					{r: !streamed && isArray, ie: ie{[][]byte{[]byte("a")}, [][]byte{}}},
+					{r: !streamed && isArray, ie: ie{[]string(nil), []string{}}},
+					{r: !streamed && isArray, ie: ie{[]string{}, []string{}}},
+					{r: !streamed && isArray, ie: ie{[]string{"a"}, []string{}}},
+					{r: !streamed && isArray, ie: ie{[]int(nil), []int{}}},
+					{r: !streamed && isArray, ie: ie{[]int{}, []int{}}},
+					{r: !streamed && isArray, ie: ie{[]int{5}, []int{}}},
+					{r: !streamed && isSet, ie: ie{map[string]struct{}(nil), map[string]struct{}{}}},
+					{r: !streamed && isSet, ie: ie{map[string]struct{}{}, map[string]struct{}{}}},
+					{r: !streamed && isSet, ie: ie{map[string]struct{}{"a": {}}, map[string]struct{}{}}},
+					{r: !streamed && isSet, ie: ie{map[int]struct{}(nil), map[int]struct{}{}}},
+					{r: !streamed && isSet, ie: ie{map[int]struct{}{}, map[int]struct{}{}}},
+					{r: !streamed && isSet, ie: ie{map[int]struct{}{1: {}}, map[int]struct{}{}}},
+					{r: !streamed && isMap, ie: ie{map[string][]byte(nil), map[string][]byte{}}},
+					{r: !streamed && isMap, ie: ie{map[string][]byte{}, map[string][]byte{}}},
+					{r: !streamed && isMap, ie: ie{map[string][]byte{"a": []byte("b")}, map[string][]byte{}}},
+					{r: !streamed && isMap, ie: ie{map[string]string(nil), map[string]string{}}},
+					{r: !streamed && isMap, ie: ie{map[string]string{}, map[string]string{}}},
+					{r: !streamed && isMap, ie: ie{map[string]string{"a": "b"}, map[string]string{}}},
+					{r: !streamed && isMap, ie: ie{map[int]int(nil), map[int]int{}}},
+					{r: !streamed && isMap, ie: ie{map[int]int{}, map[int]int{}}},
+					{r: !streamed && isMap, ie: ie{map[int]int{5: 5}, map[int]int{}}},
+				}
+			},
+		},
+		{
+			descr: "two element agg",
+			ins: []in{
+				{
+					msg:          "*2\r\n$1\r\n1\r\n$3\r\n666\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, []interface{}{[]byte("1"), []byte("666")}}},
+							{ie: ie{
+								msgSeries{&ArrayHeader{}, &BlobString{}, &BlobString{}},
+								msgSeries{
+									&ArrayHeader{NumElems: 2},
+									&BlobString{S: "1"},
+									&BlobString{S: "666"},
+								},
+							}},
+						})
+					},
+				},
+				{
+					msg:          "*?\r\n$1\r\n1\r\n:666\r\n.\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []interface{}{[]byte("1"), int64(666)}}},
+							{r: true, ie: ie{
+								msgSeries{
+									&ArrayHeader{},
+									&BlobString{},
+									&Number{},
+									&StreamedAggregatedTypeEnd{},
+								},
+								msgSeries{
+									&ArrayHeader{StreamedArrayHeader: true},
+									&BlobString{S: "1"},
+									&Number{N: 666},
+									&StreamedAggregatedTypeEnd{},
+								},
+							}},
+						}
+					},
+				},
+				{
+					msg:          "~2\r\n:1\r\n:666\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, map[interface{}]struct{}{int64(666): {}, int64(1): {}}}},
+							{ie: ie{
+								msgSeries{&SetHeader{}, &Number{}, &Number{}},
+								msgSeries{
+									&SetHeader{NumElems: 2},
+									&Number{N: 1},
+									&Number{N: 666},
+								},
+							}},
+						})
+					},
+				},
+				{
+					msg:          "~?\r\n:1\r\n:666\r\n.\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, map[interface{}]struct{}{int64(1): {}, int64(666): {}}}},
+							{r: true, ie: ie{
+								msgSeries{
+									&SetHeader{},
+									&Number{},
+									&Number{},
+									&StreamedAggregatedTypeEnd{},
+								},
+								msgSeries{
+									&SetHeader{StreamedSetHeader: true},
+									&Number{N: 1},
+									&Number{N: 666},
+									&StreamedAggregatedTypeEnd{},
+								},
+							}},
+						}
+					},
+				},
+				{
+					msg:          "%1\r\n:1\r\n:666\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, map[interface{}]interface{}{int64(1): int64(666)}}},
+							{ie: ie{
+								msgSeries{&MapHeader{}, &Number{}, &Number{}},
+								msgSeries{
+									&MapHeader{NumPairs: 1},
+									&Number{N: 1},
+									&Number{N: 666},
+								},
+							}},
+						})
+					},
+				},
+				{
+					msg:          "%?\r\n,1\r\n:666\r\n.\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, map[interface{}]interface{}{float64(1): int64(666)}}},
+							{r: true, ie: ie{
+								msgSeries{
+									&MapHeader{},
+									&Double{},
+									&Number{},
+									&StreamedAggregatedTypeEnd{},
+								},
+								msgSeries{
+									&MapHeader{StreamedMapHeader: true},
+									&Double{F: 1},
+									&Number{N: 666},
+									&StreamedAggregatedTypeEnd{},
+								},
+							}},
+						}
+					},
+				},
+				{
+					msg:          ">2\r\n+1\r\n:666\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []interface{}{"1", int64(666)}}},
+							{r: true, ie: ie{
+								msgSeries{&PushHeader{}, &SimpleString{}, &Number{}},
+								msgSeries{
+									&PushHeader{NumElems: 2},
+									&SimpleString{S: "1"},
+									&Number{N: 666},
+								},
+							}},
+						}
+					},
+				},
+			},
+			mkCases: func(in in) []kase {
+				prefix := in.prefix()
+				streamed := in.streamed()
+				return []kase{
+					{r: !streamed && prefix == ArrayPrefix, ie: ie{[][]byte(nil), [][]byte{[]byte("1"), []byte("666")}}},
+					{r: !streamed && prefix == ArrayPrefix, ie: ie{[][]byte{}, [][]byte{[]byte("1"), []byte("666")}}},
+					{r: !streamed && prefix == ArrayPrefix, ie: ie{[][]byte{[]byte("a")}, [][]byte{[]byte("1"), []byte("666")}}},
+					{r: !streamed && prefix == ArrayPrefix, ie: ie{[]string(nil), []string{"1", "666"}}},
+					{r: !streamed && prefix == ArrayPrefix, ie: ie{[]string{}, []string{"1", "666"}}},
+					{r: !streamed && prefix == ArrayPrefix, ie: ie{[]string{"a"}, []string{"1", "666"}}},
+					{ie: ie{[]int(nil), []int{1, 666}}},
+					{ie: ie{[]int{}, []int{1, 666}}},
+					{ie: ie{[]int{5}, []int{1, 666}}},
+					{ie: ie{map[string]struct{}(nil), map[string]struct{}{"666": {}, "1": {}}}},
+					{ie: ie{map[string]struct{}{}, map[string]struct{}{"666": {}, "1": {}}}},
+					{ie: ie{map[string]struct{}{"a": {}}, map[string]struct{}{"666": {}, "1": {}}}},
+					{r: !streamed && prefix == SetPrefix, ie: ie{map[int]struct{}(nil), map[int]struct{}{666: {}, 1: {}}}},
+					{r: !streamed && prefix == SetPrefix, ie: ie{map[int]struct{}{}, map[int]struct{}{666: {}, 1: {}}}},
+					{r: !streamed && prefix == SetPrefix, ie: ie{map[int]struct{}{1: {}}, map[int]struct{}{666: {}, 1: {}}}},
+					{ie: ie{map[string][]byte(nil), map[string][]byte{"1": []byte("666")}}},
+					{ie: ie{map[string][]byte{}, map[string][]byte{"1": []byte("666")}}},
+					{ie: ie{map[string][]byte{"a": []byte("b")}, map[string][]byte{"1": []byte("666")}}},
+					{ie: ie{map[string]string(nil), map[string]string{"1": "666"}}},
+					{ie: ie{map[string]string{}, map[string]string{"1": "666"}}},
+					{ie: ie{map[string]string{"a": "b"}, map[string]string{"1": "666"}}},
+					{r: !streamed && prefix == MapPrefix, ie: ie{map[int]int(nil), map[int]int{1: 666}}},
+					{r: !streamed && prefix == MapPrefix, ie: ie{map[int]int{}, map[int]int{1: 666}}},
+					{r: !streamed && prefix == MapPrefix, ie: ie{map[int]int{5: 5}, map[int]int{1: 666}}},
+					{ie: ie{map[string]int(nil), map[string]int{"1": 666}}},
+					{ie: ie{map[string]int{}, map[string]int{"1": 666}}},
+					{ie: ie{map[string]int{"5": 5}, map[string]int{"1": 666}}},
+				}
+			},
+		},
+		{
+			descr: "nested two element agg",
+			ins: []in{
+				{
+					label:        "arr-arr",
+					msg:          "*1\r\n*2\r\n$1\r\n1\r\n$3\r\n666\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, []interface{}{[]interface{}{[]byte("1"), []byte("666")}}}},
+						})
+					},
+				},
+				{
+					msg:          "*?\r\n*2\r\n$1\r\n1\r\n:666\r\n.\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []interface{}{[]interface{}{[]byte("1"), int64(666)}}}},
+						}
+					},
+				},
+				{
+					label:        "arr-set",
+					msg:          "*1\r\n~2\r\n:1\r\n:666\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, []interface{}{
+								map[interface{}]struct{}{int64(666): {}, int64(1): {}},
+							}}},
+						})
+					},
+				},
+				{
+					msg:          "*?\r\n~2\r\n:1\r\n:666\r\n.\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []interface{}{map[interface{}]struct{}{int64(1): {}, int64(666): {}}}}},
+						}
+					},
+				},
+				{
+					label:        "arr-map",
+					msg:          "*1\r\n%1\r\n:1\r\n$3\r\n666\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, []interface{}{map[interface{}]interface{}{int64(1): []byte("666")}}}},
+						})
+					},
+				},
+				{
+					label:        "arr-map-simple",
+					msg:          "*1\r\n%1\r\n:1\r\n$3\r\n666\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return setReversable(true, []kase{
+							{ie: ie{nil, []interface{}{map[interface{}]interface{}{int64(1): []byte("666")}}}},
+						})
+					},
+				},
+				{
+					msg:          "*?\r\n%1\r\n:1\r\n$3\r\n666\r\n.\r\n",
+					msgAsFlatStr: "$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []interface{}{map[interface{}]interface{}{int64(1): []byte("666")}}}},
+						}
+					},
+				},
+			},
+			mkCases: func(in in) []kase {
+				return []kase{
+					{r: in.label == "arr-arr", ie: ie{[][][]byte(nil), [][][]byte{{[]byte("1"), []byte("666")}}}},
+					{r: in.label == "arr-arr", ie: ie{[][][]byte{}, [][][]byte{{[]byte("1"), []byte("666")}}}},
+					{r: in.label == "arr-arr", ie: ie{[][][]byte{{}, {[]byte("a")}}, [][][]byte{{[]byte("1"), []byte("666")}}}},
+					{r: in.label == "arr-arr", ie: ie{[][]string(nil), [][]string{{"1", "666"}}}},
+					{r: in.label == "arr-arr", ie: ie{[][]string{}, [][]string{{"1", "666"}}}},
+					{r: in.label == "arr-arr", ie: ie{[][]string{{}, {"a"}}, [][]string{{"1", "666"}}}},
+					{ie: ie{[][]int(nil), [][]int{{1, 666}}}},
+					{ie: ie{[][]int{}, [][]int{{1, 666}}}},
+					{ie: ie{[][]int{{7}, {5}}, [][]int{{1, 666}}}},
+					{ie: ie{[]map[string]struct{}(nil), []map[string]struct{}{{"666": {}, "1": {}}}}},
+					{ie: ie{[]map[string]struct{}{}, []map[string]struct{}{{"666": {}, "1": {}}}}},
+					{ie: ie{[]map[string]struct{}{{"a": {}}}, []map[string]struct{}{{"666": {}, "1": {}}}}},
+					{r: in.label == "arr-set", ie: ie{[]map[int]struct{}(nil), []map[int]struct{}{{666: {}, 1: {}}}}},
+					{r: in.label == "arr-set", ie: ie{[]map[int]struct{}{}, []map[int]struct{}{{666: {}, 1: {}}}}},
+					{r: in.label == "arr-set", ie: ie{[]map[int]struct{}{{1: {}}}, []map[int]struct{}{{666: {}, 1: {}}}}},
+					{ie: ie{[]map[string][]byte(nil), []map[string][]byte{{"1": []byte("666")}}}},
+					{ie: ie{[]map[string][]byte{}, []map[string][]byte{{"1": []byte("666")}}}},
+					{ie: ie{[]map[string][]byte{{}, {"a": []byte("b")}}, []map[string][]byte{{"1": []byte("666")}}}},
+					{ie: ie{[]map[string]string(nil), []map[string]string{{"1": "666"}}}},
+					{ie: ie{[]map[string]string{}, []map[string]string{{"1": "666"}}}},
+					{ie: ie{[]map[string]string{{}, {"a": "b"}}, []map[string]string{{"1": "666"}}}},
+					{ie: ie{[]map[int]int(nil), []map[int]int{{1: 666}}}},
+					{ie: ie{[]map[int]int{}, []map[int]int{{1: 666}}}},
+					{ie: ie{[]map[int]int{{4: 2}, {7: 5}}, []map[int]int{{1: 666}}}},
+					{r: in.label == "arr-map-simple", ie: ie{[]map[int]string(nil), []map[int]string{{1: "666"}}}},
+					{r: in.label == "arr-map-simple", ie: ie{[]map[int]string{}, []map[int]string{{1: "666"}}}},
+					{r: in.label == "arr-map-simple", ie: ie{[]map[int]string{{4: "2"}, {7: "5"}}, []map[int]string{{1: "666"}}}},
+				}
+			},
+		},
+		{
+			descr: "keyed nested two element agg",
+			ins: []in{
+				{
+					msg:          "*2\r\n$2\r\n10\r\n*2\r\n$1\r\n1\r\n:666\r\n",
+					msgAsFlatStr: "$2\r\n10\r\n$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{r: true, ie: ie{nil, []interface{}{[]byte("10"), []interface{}{[]byte("1"), int64(666)}}}},
+						}
+					},
+				},
+				{
+					msg:          "*?\r\n$2\r\n10\r\n*2\r\n$1\r\n1\r\n:666\r\n.\r\n",
+					msgAsFlatStr: "$2\r\n10\r\n$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []interface{}{[]byte("10"), []interface{}{[]byte("1"), int64(666)}}}},
+						}
+					},
+				},
+				{
+					msg:          "*2\r\n$2\r\n10\r\n~2\r\n:1\r\n:666\r\n",
+					msgAsFlatStr: "$2\r\n10\r\n$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{r: true, ie: ie{nil, []interface{}{
+								[]byte("10"),
+								map[interface{}]struct{}{int64(666): {}, int64(1): {}},
+							}}},
+						}
+					},
+				},
+				{
+					msg:          "*?\r\n$2\r\n10\r\n~2\r\n:1\r\n:666\r\n.\r\n",
+					msgAsFlatStr: "$2\r\n10\r\n$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []interface{}{
+								[]byte("10"),
+								map[interface{}]struct{}{int64(666): {}, int64(1): {}},
+							}}},
+						}
+					},
+				},
+				{
+					msg:          "%1\r\n:10\r\n%1\r\n:1\r\n$3\r\n666\r\n",
+					msgAsFlatStr: "$2\r\n10\r\n$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{r: true, ie: ie{nil, map[interface{}]interface{}{
+								int64(10): map[interface{}]interface{}{int64(1): []byte("666")},
+							}}},
+						}
+					},
+				},
+				{
+					msg:          "%?\r\n:10\r\n%1\r\n:1\r\n$3\r\n666\r\n.\r\n",
+					msgAsFlatStr: "$2\r\n10\r\n$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, map[interface{}]interface{}{
+								int64(10): map[interface{}]interface{}{int64(1): []byte("666")},
+							}}},
+						}
+					},
+				},
+				{
+					msg:          ">2\r\n$2\r\n10\r\n*2\r\n$1\r\n1\r\n:666\r\n",
+					msgAsFlatStr: "$2\r\n10\r\n$1\r\n1\r\n$3\r\n666\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []interface{}{[]byte("10"), []interface{}{[]byte("1"), int64(666)}}}},
+						}
+					},
+				},
+			},
+			mkCases: func(in in) []kase {
+				prefix := in.prefix()
+				streamed := in.streamed()
+				return []kase{
+					{ie: ie{map[string]map[string][]byte(nil), map[string]map[string][]byte{"10": {"1": []byte("666")}}}},
+					{ie: ie{map[string]map[string][]byte{}, map[string]map[string][]byte{"10": {"1": []byte("666")}}}},
+					{ie: ie{map[string]map[string][]byte{"foo": {"a": []byte("b")}}, map[string]map[string][]byte{"10": {"1": []byte("666")}}}},
+					{ie: ie{map[string]map[string]string(nil), map[string]map[string]string{"10": {"1": "666"}}}},
+					{ie: ie{map[string]map[string]string{}, map[string]map[string]string{"10": {"1": "666"}}}},
+					{ie: ie{map[string]map[string]string{"foo": {"a": "b"}}, map[string]map[string]string{"10": {"1": "666"}}}},
+					{r: !streamed && prefix == MapPrefix, ie: ie{map[int]map[int]string(nil), map[int]map[int]string{10: {1: "666"}}}},
+					{r: !streamed && prefix == MapPrefix, ie: ie{map[int]map[int]string{}, map[int]map[int]string{10: {1: "666"}}}},
+					{r: !streamed && prefix == MapPrefix, ie: ie{map[int]map[int]string{777: {4: "2"}}, map[int]map[int]string{10: {1: "666"}}}},
+					{ie: ie{map[int]map[int]int(nil), map[int]map[int]int{10: {1: 666}}}},
+					{ie: ie{map[int]map[int]int{}, map[int]map[int]int{10: {1: 666}}}},
+					{ie: ie{map[int]map[int]int{5: {4: 2}}, map[int]map[int]int{10: {1: 666}}}},
+				}
+			},
+		},
+		{
+			descr: "agg into struct",
+			ins: []in{
+				{
+					label:        "arr",
+					msg:          "*10\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n",
+					msgAsFlatStr: "$3\r\nFoo\r\n$1\r\n1\r\n$3\r\nBAZ\r\n$1\r\n2\r\n$3\r\nBoz\r\n$1\r\n3\r\n$3\r\nBiz\r\n$1\r\n4\r\n",
+				},
+				{
+					label:        "map",
+					msg:          "%5\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n",
+					msgAsFlatStr: "$3\r\nFoo\r\n$1\r\n1\r\n$3\r\nBAZ\r\n$1\r\n2\r\n$3\r\nBoz\r\n$1\r\n3\r\n$3\r\nBiz\r\n$1\r\n4\r\n",
+				},
+				{
+					label:        "map-exact",
+					msg:          "%4\r\n+Foo\r\n:1\r\n+BAZ\r\n$1\r\n2\r\n+Boz\r\n:3\r\n+Biz\r\n$1\r\n4\r\n",
+					msgAsFlatStr: "$3\r\nFoo\r\n$1\r\n1\r\n$3\r\nBAZ\r\n$1\r\n2\r\n$3\r\nBoz\r\n$1\r\n3\r\n$3\r\nBiz\r\n$1\r\n4\r\n",
+				},
+				{
+					msg:          "*?\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n.\r\n",
+					msgAsFlatStr: "$3\r\nFoo\r\n$1\r\n1\r\n$3\r\nBAZ\r\n$1\r\n2\r\n$3\r\nBoz\r\n$1\r\n3\r\n$3\r\nBiz\r\n$1\r\n4\r\n",
+				},
+				{
+					msg:          "%?\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n.\r\n",
+					msgAsFlatStr: "$3\r\nFoo\r\n$1\r\n1\r\n$3\r\nBAZ\r\n$1\r\n2\r\n$3\r\nBoz\r\n$1\r\n3\r\n$3\r\nBiz\r\n$1\r\n4\r\n",
+				},
+				{
+					msg:          "~?\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n.\r\n",
+					msgAsFlatStr: "$3\r\nFoo\r\n$1\r\n1\r\n$3\r\nBAZ\r\n$1\r\n2\r\n$3\r\nBoz\r\n$1\r\n3\r\n$3\r\nBiz\r\n$1\r\n4\r\n",
+				},
+			},
+			mkCases: func(in in) []kase {
+				isExact := in.label == "map-exact"
+				return []kase{
+					{r: isExact, ie: ie{testStructA{}, testStructA{TestStructInner{Foo: 1, Baz: "2", Boz: intPtr(3)}, []byte("4")}}},
+					{r: isExact, ie: ie{&testStructA{}, &testStructA{TestStructInner{Foo: 1, Baz: "2", Boz: intPtr(3)}, []byte("4")}}},
+					{r: isExact, ie: ie{testStructA{TestStructInner{bar: 6}, []byte("foo")}, testStructA{TestStructInner{Foo: 1, bar: 6, Baz: "2", Boz: intPtr(3)}, []byte("4")}}},
+					{r: isExact, ie: ie{&testStructA{TestStructInner{bar: 6}, []byte("foo")}, &testStructA{TestStructInner{Foo: 1, bar: 6, Baz: "2", Boz: intPtr(3)}, []byte("4")}}},
+					{r: isExact, ie: ie{testStructB{}, testStructB{&TestStructInner{Foo: 1, Baz: "2", Boz: intPtr(3)}, []byte("4")}}},
+					{r: isExact, ie: ie{&testStructB{}, &testStructB{&TestStructInner{Foo: 1, Baz: "2", Boz: intPtr(3)}, []byte("4")}}},
+					{r: isExact, ie: ie{testStructB{&TestStructInner{bar: 6}, []byte("foo")}, testStructB{&TestStructInner{Foo: 1, bar: 6, Baz: "2", Boz: intPtr(3)}, []byte("4")}}},
+					{r: isExact, ie: ie{&testStructB{&TestStructInner{bar: 6}, []byte("foo")}, &testStructB{&TestStructInner{Foo: 1, bar: 6, Baz: "2", Boz: intPtr(3)}, []byte("4")}}},
+				}
+			},
+		},
+		{
+			descr: "empty streamed string",
+			ins: []in{
+				{
+					msg:          "$?\r\n;0\r\n",
+					msgAsFlatStr: "$0\r\n\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{ie: ie{nil, []byte{}}},
+							{r: true, ie: ie{streamedStrRW{}, streamedStrRW{}}},
+							{r: true, ie: ie{
+								msgSeries{&BlobString{}, &StreamedStringChunk{}},
+								msgSeries{&BlobString{StreamedStringHeader: true}, &StreamedStringChunk{S: ""}},
+							}},
+							{r: true, ie: ie{
+								msgSeries{&BlobString{S: "foo"}, &StreamedStringChunk{S: "foo"}},
+								msgSeries{&BlobString{StreamedStringHeader: true}, &StreamedStringChunk{S: ""}},
+							}},
+							{r: true, ie: ie{
+								msgSeries{&BlobStringBytes{}, &StreamedStringChunkBytes{}},
+								msgSeries{&BlobStringBytes{StreamedStringHeader: true}, &StreamedStringChunkBytes{B: []byte{}}},
+							}},
+							{r: true, ie: ie{
+								msgSeries{&BlobStringBytes{B: []byte("foo")}, &StreamedStringChunkBytes{B: []byte("foo")}},
+								msgSeries{&BlobStringBytes{StreamedStringHeader: true}, &StreamedStringChunkBytes{B: []byte{}}},
+							}},
+						}
+					},
+				},
+			},
+			mkCases: func(in in) []kase {
+				return setReversable(false, strCases(in, ""))
+			},
+		},
+		{
+			descr: "streamed string",
+			ins: []in{
+				{
+					msg:          "$?\r\n;4\r\nohey\r\n;0\r\n",
+					msgAsFlatStr: "$4\r\nohey\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{r: true, ie: ie{
+								streamedStrRW{},
+								streamedStrRW{[]byte("ohey")},
+							}},
+							{r: true, ie: ie{
+								msgSeries{
+									&BlobString{},
+									&StreamedStringChunk{},
+									&StreamedStringChunk{},
+								},
+								msgSeries{
+									&BlobString{StreamedStringHeader: true},
+									&StreamedStringChunk{S: "ohey"},
+									&StreamedStringChunk{S: ""},
+								},
+							}},
+							{r: true, ie: ie{
+								msgSeries{
+									&BlobStringBytes{},
+									&StreamedStringChunkBytes{},
+									&StreamedStringChunkBytes{},
+								},
+								msgSeries{
+									&BlobStringBytes{StreamedStringHeader: true},
+									&StreamedStringChunkBytes{B: []byte("ohey")},
+									&StreamedStringChunkBytes{B: []byte{}},
+								},
+							}},
+						}
+					},
+				},
+				{
+					msg:          "$?\r\n;2\r\noh\r\n;2\r\ney\r\n;0\r\n",
+					msgAsFlatStr: "$4\r\nohey\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{r: true, ie: ie{
+								streamedStrRW{},
+								streamedStrRW{[]byte("oh"), []byte("ey")},
+							}},
+							{r: true, ie: ie{
+								msgSeries{
+									&BlobString{},
+									&StreamedStringChunk{},
+									&StreamedStringChunk{},
+									&StreamedStringChunk{},
+								},
+								msgSeries{
+									&BlobString{StreamedStringHeader: true},
+									&StreamedStringChunk{S: "oh"},
+									&StreamedStringChunk{S: "ey"},
+									&StreamedStringChunk{S: ""},
+								},
+							}},
+							{r: true, ie: ie{
+								msgSeries{
+									&BlobStringBytes{},
+									&StreamedStringChunkBytes{},
+									&StreamedStringChunkBytes{},
+									&StreamedStringChunkBytes{},
+								},
+								msgSeries{
+									&BlobStringBytes{StreamedStringHeader: true},
+									&StreamedStringChunkBytes{B: []byte("oh")},
+									&StreamedStringChunkBytes{B: []byte("ey")},
+									&StreamedStringChunkBytes{B: []byte{}},
+								},
+							}},
+						}
+					},
+				},
+				{
+					msg:          "$?\r\n;1\r\no\r\n;1\r\nh\r\n;2\r\ney\r\n;0\r\n",
+					msgAsFlatStr: "$4\r\nohey\r\n",
+					mkCases: func() []kase {
+						return []kase{
+							{r: true, ie: ie{
+								streamedStrRW{},
+								streamedStrRW{[]byte("o"), []byte("h"), []byte("ey")},
+							}},
+							{r: true, ie: ie{
+								msgSeries{
+									&BlobString{},
+									&StreamedStringChunk{},
+									&StreamedStringChunk{},
+									&StreamedStringChunk{},
+									&StreamedStringChunk{},
+								},
+								msgSeries{
+									&BlobString{StreamedStringHeader: true},
+									&StreamedStringChunk{S: "o"},
+									&StreamedStringChunk{S: "h"},
+									&StreamedStringChunk{S: "ey"},
+									&StreamedStringChunk{S: ""},
+								},
+							}},
+							{r: true, ie: ie{
+								msgSeries{
+									&BlobStringBytes{},
+									&StreamedStringChunkBytes{},
+									&StreamedStringChunkBytes{},
+									&StreamedStringChunkBytes{},
+									&StreamedStringChunkBytes{},
+								},
+								msgSeries{
+									&BlobStringBytes{StreamedStringHeader: true},
+									&StreamedStringChunkBytes{B: []byte("o")},
+									&StreamedStringChunkBytes{B: []byte("h")},
+									&StreamedStringChunkBytes{B: []byte("ey")},
+									&StreamedStringChunkBytes{B: []byte{}},
+								},
+							}},
+						}
+					},
+				},
+			},
+			mkCases: func(in in) []kase {
+				cases := setReversable(false, strCases(in, "ohey"))
+				cases = append(cases, []kase{
+					{ie: ie{nil, []byte("ohey")}},
+				}...)
+				return cases
 			},
 		},
 	}
 
-	for i, dt := range decodeTests {
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			br := bufio.NewReader(bytes.NewBufferString(dt.in))
+	// TODO RawMessage
 
-			var into interface{}
-			if dt.preloadEmpty {
-				emptyInterfaceT := reflect.TypeOf([]interface{}(nil)).Elem()
-				into = reflect.New(emptyInterfaceT).Interface()
-			} else if dt.preload != nil {
-				intov := reflect.New(reflect.TypeOf(dt.preload))
-				intov.Elem().Set(reflect.ValueOf(dt.preload))
-				into = intov.Interface()
-			} else if dt.out != nil {
-				into = reflect.New(reflect.TypeOf(dt.out)).Interface()
-			}
+	for _, umt := range unmarshalMarshalTests {
+		t.Run(umt.descr, func(t *testing.T) {
+			for i, in := range umt.ins {
 
-			err := Any{I: into}.UnmarshalRESP(br)
-			if dt.shouldErr != "" {
-				require.NotNil(t, err)
-				assert.Equal(t, dt.shouldErr, err.Error())
-				return
-			}
+				assertMarshals := func(t *testing.T, exp string, i interface{}) {
+					t.Logf("%#v -> %q", i, in.msg)
+					buf := new(bytes.Buffer)
+					assert.NoError(t, (Any{
+						I:                    i,
+						MarshalDeterministic: true,
+					}).MarshalRESP(buf))
+					assert.Equal(t, exp, buf.String())
+				}
 
-			require.Nil(t, err)
-			if dt.out != nil {
-				aI := reflect.ValueOf(into).Elem().Interface()
-				assert.Equal(t, dt.out, aI)
-			} else {
-				assert.Nil(t, into)
+				assertMarshalsFlatStr := func(t *testing.T, exp string, i interface{}) {
+					t.Logf("%#v (flattened to blob strings) -> %q", i, in.msgAsFlatStr)
+					buf := new(bytes.Buffer)
+					assert.NoError(t, (Any{
+						I:                    i,
+						MarshalDeterministic: true,
+						MarshalNoAggHeaders:  true,
+						MarshalBlobString:    true,
+					}).MarshalRESP(buf))
+					assert.Equal(t, exp, buf.String())
+				}
+
+				if umt.shouldErr != nil {
+					buf := bytes.NewBufferString(in.msg)
+					br := bufio.NewReader(buf)
+					err := Any{}.UnmarshalRESP(br)
+					assert.Equal(t, umt.shouldErr, err)
+					assert.Zero(t, br.Buffered())
+					assert.Empty(t, buf.Bytes())
+
+					var errConnUsable resp.ErrConnUsable
+					assert.True(t, errors.As(err, &errConnUsable))
+					assertMarshals(t, in.msg, errConnUsable.Err)
+					continue
+				}
+
+				t.Run("discard", func(t *testing.T) {
+					buf := bytes.NewBufferString(in.msg)
+					br := bufio.NewReader(buf)
+					err := Any{}.UnmarshalRESP(br)
+					assert.NoError(t, err)
+					assert.Zero(t, br.Buffered())
+					assert.Empty(t, buf.Bytes())
+				})
+
+				testName := in.label
+				if testName == "" {
+					testName = fmt.Sprintf("in%d", i)
+				}
+
+				t.Run(testName, func(t *testing.T) {
+					t.Run("raw message", func(t *testing.T) {
+						buf := bytes.NewBufferString(in.msg)
+						br := bufio.NewReader(buf)
+						var rm RawMessage
+						assert.NoError(t, rm.UnmarshalRESP(br))
+						assert.Equal(t, in.msg, string(rm))
+						assert.Zero(t, br.Buffered())
+						assert.Empty(t, buf.Bytes())
+					})
+
+					run := func(withAttr, marshalAsFlatStr bool) func(t *testing.T) {
+						return func(t *testing.T) {
+							for _, kase := range umt.cases(in) {
+								t.Run(kase.label, func(t *testing.T) {
+									t.Logf("%q -> %#v", in.msg, kase.ie[0])
+									buf := new(bytes.Buffer)
+									br := bufio.NewReader(buf)
+
+									// test unmarshaling
+									if withAttr {
+										AttributeHeader{NumPairs: 2}.MarshalRESP(buf)
+										SimpleString{S: "foo"}.MarshalRESP(buf)
+										SimpleString{S: "1"}.MarshalRESP(buf)
+										SimpleString{S: "bar"}.MarshalRESP(buf)
+										SimpleString{S: "2"}.MarshalRESP(buf)
+									}
+									buf.WriteString(in.msg)
+
+									var intoPtrVal reflect.Value
+									if kase.ie[0] == nil {
+										intoPtrVal = reflect.ValueOf(&kase.ie[0])
+									} else {
+										intoOrigVal := reflect.ValueOf(kase.ie[0])
+										intoPtrVal = reflect.New(intoOrigVal.Type())
+										intoPtrVal.Elem().Set(intoOrigVal)
+									}
+
+									err := Any{I: intoPtrVal.Interface()}.UnmarshalRESP(br)
+									assert.NoError(t, err)
+
+									into := intoPtrVal.Elem().Interface()
+									exp := kase.ie[1]
+									switch exp := exp.(type) {
+									case *big.Int:
+										assert.Zero(t, exp.Cmp(into.(*big.Int)))
+									case *big.Float:
+										assert.Zero(t, exp.Cmp(into.(*big.Float)))
+									case BigNumber:
+										assert.Zero(t, exp.I.Cmp(into.(BigNumber).I))
+									default:
+										assert.Equal(t, exp, into)
+									}
+									assert.Empty(t, buf.Bytes())
+									assert.Zero(t, br.Buffered())
+
+									if kase.r {
+										if _, marshaler := exp.(resp.Marshaler); !marshaler && marshalAsFlatStr {
+											msgAsFlatStr := in.msgAsFlatStr
+											if kase.flatStrEmpty {
+												msgAsFlatStr = ""
+											}
+											assertMarshalsFlatStr(t, msgAsFlatStr, exp)
+										} else {
+											assertMarshals(t, in.msg, exp)
+										}
+									}
+								})
+							}
+						}
+					}
+
+					t.Run("without attr/marshal", run(false, false))
+					t.Run("with attr/marshal", run(true, false))
+					t.Run("without attr/marshalFlatStr", run(false, true))
+					t.Run("with attr/marshalFlatStr", run(true, true))
+
+					t.Run("numElems", func(t *testing.T) {
+						for _, kase := range umt.cases(in) {
+							t.Run(kase.label, func(t *testing.T) {
+								expNumElems := in.expNumElems()
+								if _, ok := kase.ie[1].(resp.Marshaler); ok {
+									t.Skip("is a resp.Marshaler")
+								} else if kase.flatStrEmpty {
+									expNumElems = 0
+								}
+
+								t.Logf("numElems(%#v) -> %d", kase.ie[1], expNumElems)
+								numElems, err := Any{I: kase.ie[1]}.NumElems()
+								assert.NoError(t, err)
+								assert.Equal(t, expNumElems, numElems)
+							})
+						}
+					})
+				})
 			}
 		})
-	}
-}
-
-func TestRawMessage(t *T) {
-	rmtests := []struct {
-		b       string
-		isNil   bool
-		isEmpty bool
-	}{
-		{b: "+\r\n"},
-		{b: "+foo\r\n"},
-		{b: "-\r\n"},
-		{b: "-foo\r\n"},
-		{b: ":5\r\n"},
-		{b: ":0\r\n"},
-		{b: ":-5\r\n"},
-		{b: "$-1\r\n", isNil: true},
-		{b: "$0\r\n\r\n"},
-		{b: "$3\r\nfoo\r\n"},
-		{b: "$8\r\nfoo\r\nbar\r\n"},
-		{b: "*2\r\n:1\r\n:2\r\n"},
-		{b: "*-1\r\n", isNil: true},
-		{b: "*0\r\n", isEmpty: true},
-	}
-
-	// one at a time
-	for _, rmt := range rmtests {
-		buf := new(bytes.Buffer)
-		{
-			rm := RawMessage(rmt.b)
-			require.Nil(t, rm.MarshalRESP(buf))
-			assert.Equal(t, rmt.b, buf.String())
-			assert.Equal(t, rmt.isNil, rm.IsNil())
-			assert.Equal(t, rmt.isEmpty, rm.IsEmptyArray())
-		}
-		{
-			var rm RawMessage
-			require.Nil(t, rm.UnmarshalRESP(bufio.NewReader(buf)))
-			assert.Equal(t, rmt.b, string(rm))
-		}
 	}
 }
 
@@ -839,7 +1786,7 @@ func Example_streamedAggregatedType() {
 	(Number{N: 1}).MarshalRESP(buf)
 	(Number{N: 2}).MarshalRESP(buf)
 	(Number{N: 3}).MarshalRESP(buf)
-	(StreamedAggregatedEnd{}).MarshalRESP(buf)
+	(StreamedAggregatedTypeEnd{}).MarshalRESP(buf)
 
 	// Now create a reader which will read from the buffer, and use it to read
 	// the streamed array.
@@ -863,8 +1810,8 @@ func Example_streamedAggregatedType() {
 	}
 
 	// Output: streamed array begun
-	// Output: read element with value 1
-	// Output: read element with value 2
-	// Output: read element with value 3
-	// Output: streamed array ended
+	// read element with value 1
+	// read element with value 2
+	// read element with value 3
+	// streamed array ended
 }
